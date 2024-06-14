@@ -1,0 +1,234 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from concurrent.futures import ProcessPoolExecutor
+
+output_directory = '/ /'  # Base path for all outputs
+
+def power_law(x, a, b):
+    return a * np.power(x, b)
+
+def fit_power_law(x, y):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    valid_indices = ~np.isnan(y) & ~np.isinf(y)
+    x_filtered = x[valid_indices]
+    y_filtered = y[valid_indices]
+
+    log_x = np.log10(x_filtered)
+    log_y = np.log10(y_filtered)
+    
+    if len(log_x) == 0 or len(log_y) == 0:
+        return np.nan  # Return NaN if there are no valid data points
+
+    try:
+        params, _ = curve_fit(lambda t, a, b: a * t + b, log_x, log_y, maxfev=10000)
+        return params[0]  # Return the exponent b
+    except (RuntimeError, ValueError) as e:
+        print(f"Curve fitting failed: {e}")
+        return np.nan  # Return NaN if curve fitting fails
+
+def compute_msd(df, interval_skip=20, sampling_interval=0.01):
+    max_lag = int(1 / sampling_interval)  # Maximum time lag of 1 second
+    msd_results = []
+    alpha_values = []
+
+    bead_ids = df['beadId'].unique()
+    selected_beads = np.linspace(0, len(bead_ids) - 1, 20, dtype=int)  # To increase the speed we select 20 beads uniformly
+    bead_ids = bead_ids[selected_beads]  # Filter bead IDs
+    df = df.sort_values('time(s)')
+    current_time = df['time(s)'].min()
+    end_time = df['time(s)'].max()
+    post_5000_msd_values = []
+    
+    while current_time <= end_time:
+        if current_time > 500 and current_time <= 5000:
+            current_time += interval_skip  # Skip time points between 500 and 5000 seconds
+            continue
+
+        if current_time > 5000 and len(post_5000_msd_values) >= 10:
+            break  # Only process the first ten intervals after 5000 seconds
+
+        df_subset = df[(df['time(s)'] >= current_time) & (df['time(s)'] < current_time + 1)]
+        if df_subset.empty:
+            current_time += interval_skip  # Skip 19 seconds--because our MSD write frequency is 20 seconds
+            continue
+        msd_values = []
+        
+        for lag in range(1, max_lag + 1):
+            displacement_squared = []
+
+            for bead_id in bead_ids:
+                bead_data = df_subset[df_subset['beadId'] == bead_id]
+                
+                if len(bead_data) > lag:
+                    for i in range(len(bead_data) - lag):
+                        if np.isclose(bead_data['time(s)'].values[i] + lag * sampling_interval, bead_data['time(s)'].values[i + lag], atol=1e-5):
+                            displacement = (bead_data[['x(nm)', 'y(nm)', 'z(nm)']].iloc[i + lag] - bead_data[['x(nm)', 'y(nm)', 'z(nm)']].iloc[i]) ** 2
+                            total_displacement = displacement.sum()
+                            displacement_squared.append(total_displacement)
+            
+            if displacement_squared:
+                msd = np.mean(displacement_squared)
+                msd_values.append(msd * 1e-6)  # Convert from nm^2 to µm^2
+            else:
+                msd_values.append(np.nan)  # Append NaN if no data available for this lag
+
+        if msd_values and not all(np.isnan(msd_values)):
+            alpha = fit_power_law(np.arange(1, len(msd_values) + 1) * 0.01, msd_values)
+            alpha_values.append(alpha)
+            msd_results.append({
+                'start_time': current_time,
+                'msd_values': msd_values,
+                'alpha': alpha
+            })
+            for lag, msd_value in enumerate(msd_values, start=1):
+                print(f"Start Time: {current_time}, Time Lag: {lag * sampling_interval:.3f}, MSD: {msd_value:.6f}, Alpha: {alpha:.6f}")
+        
+        if current_time > 5000:
+            post_5000_msd_values.append(msd_values)
+        
+        current_time += interval_skip  # Move to the next start time
+    
+    if post_5000_msd_values:
+        avg_post_5000_msd = np.nanmean(post_5000_msd_values, axis=0)
+        avg_alpha = fit_power_law(np.arange(1, len(avg_post_5000_msd) + 1) * 0.01, avg_post_5000_msd)
+        msd_results.append({
+            'start_time': 'post 5000s',
+            'msd_values': avg_post_5000_msd,
+            'alpha': avg_alpha
+        })
+        for lag, msd_value in enumerate(avg_post_5000_msd, start=1):
+            print(f"Start Time: post 5000s, Time Lag: {lag * sampling_interval:.3f}, MSD: {msd_value:.6f}, Alpha: {avg_alpha:.6f}")
+
+    return msd_results, alpha_values
+
+def plot_msd(msd_results, file_index):
+    plt.figure(figsize=(14, 8))  # Adjusted the figure size for better legend fitting
+    colormap = plt.cm.get_cmap('viridis', len(msd_results))  # Choose a colormap with enough unique colors
+    
+    for index, data in enumerate(msd_results):
+        start_time = data['start_time']
+        msd_values = data['msd_values']
+        time_lags = np.arange(1, len(msd_values) + 1) * 0.01
+        alpha = data['alpha']
+        if np.isnan(alpha):
+            continue  # Skip plotting if alpha is NaN
+        plt.plot(time_lags, msd_values, color=colormap(index), label=f'Start Time {start_time}, α={alpha:.2f}')
+    
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.xlabel('Time lag (s)')
+    plt.ylabel('Mean Squared Displacement (µm²)')
+    plt.title(f'MSD for Replicate {file_index}')
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1), ncol=1)  # Adjust legend to fit within the figure
+    plt.grid(True, which="both", ls="--")
+    plt.tight_layout()  # Adjust layout to make room for legend
+    plt.savefig(f'{output_directory}msd_replicate_{file_index}.png')
+    plt.close()
+    print(f"MSD plot saved to {output_directory}msd_replicate_{file_index}.png")
+
+def plot_aggregated_msd(all_msd_data):
+    colormap = plt.cm.get_cmap('tab20', 30)  # Choose a colormap with 30 unique colors
+    
+    unique_start_times = sorted(set(result['start_time'] for result in all_msd_data))
+    plt.figure(figsize=(14, 8))  # Adjusted the figure size for better legend fitting
+
+    for index, start_time in enumerate(unique_start_times):
+        msd_values_list = [result['msd_values'] for result in all_msd_data if result['start_time'] == start_time]
+        if not msd_values_list:
+            continue
+        
+        msd_array = np.array(msd_values_list)
+        valid_indices = ~np.isnan(msd_array).all(axis=0)
+        msd_mean = np.nanmean(msd_array[:, valid_indices], axis=0)
+        msd_std = np.nanstd(msd_array[:, valid_indices], axis=0)
+        time_lags = np.arange(1, len(msd_mean) + 1) * 0.01
+
+        alpha = fit_power_law(time_lags, msd_mean)
+        if np.isnan(alpha):
+            print(f"Skipping plot for start time {start_time} due to invalid alpha.")
+            continue
+
+        plt.plot(time_lags, msd_mean, color=colormap(index), label=f'Start Time {start_time}, α={alpha:.2f}')
+        plt.fill_between(time_lags, msd_mean - msd_std, msd_mean + msd_std, color=colormap(index), alpha=0.3)
+
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.xlabel('Time lag (s)')
+    plt.ylabel('Mean Squared Displacement (µm²)')
+    plt.title('Average MSD Across Time Points with SD')
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1), ncol=1)  # Adjust legend to fit within the figure
+    plt.grid(True, which="both", ls="--")
+    plt.tight_layout()  # Adjust layout to make room for legend
+    plt.savefig(f'{output_directory}aggregated_msd.png')
+    plt.close()
+    print(f"Aggregated MSD plot saved to {output_directory}aggregated_msd.png")
+    # Generate separate legend figure
+    fig_legend = plt.figure(figsize=(10, 6))
+    fig_legend.legend(*plt.gca().get_legend_handles_labels(), loc='center', ncol=2)
+    fig_legend.savefig(f'{output_directory}legend.png')
+    plt.close(fig_legend)
+    print(f"Legend plot saved to {output_directory}legend.png")
+
+def save_msd_results(msd_results, file_index):
+    msd_data = []
+    alpha_data = []
+    for data in msd_results:
+        start_time = data['start_time']
+        alpha = data['alpha']
+        alpha_data.append([start_time, alpha])
+        for lag, msd_value in enumerate(data['msd_values'], start=1):
+            msd_data.append([start_time, lag * 0.01, msd_value])
+    
+    msd_df = pd.DataFrame(msd_data, columns=['Start Time', 'Time Lag (s)', 'MSD (µm²)'])
+    alpha_df = pd.DataFrame(alpha_data, columns=['Start Time', 'Alpha'])
+    msd_df.to_csv(f'{output_directory}msd_results_{file_index}.csv', index=False)
+    alpha_df.to_csv(f'{output_directory}alpha_values_{file_index}.csv', index=False)
+    print(f"MSD results saved to {output_directory}msd_results_{file_index}.csv")
+    print(f"Alpha values saved to {output_directory}alpha_values_{file_index}.csv")
+
+def process_file(file_path, file_index):
+    print(f"Processing file: {file_path}")
+    df = pd.read_csv(file_path, delimiter='\t')  # Limit to the first 100,000 rows
+    df = df[df.iloc[:, 5] == 'N']
+    if df.empty:
+        print(f"Warning: {file_path} is empty.")
+        return []
+
+    if df.shape[1] < 5:
+        print(f"Warning: {file_path} does not have the expected number of columns.")
+        return []
+
+    msd_results, alpha_values = compute_msd(df)
+
+    # Save the MSD results for the current file
+    save_msd_results(msd_results, file_index)
+
+    # Plot and save the MSD for the current file
+    plot_msd(msd_results, file_index)
+
+    return msd_results
+
+def process_files_parallel(files):
+    all_msd_data = []
+
+    with ProcessPoolExecutor() as executor:
+        futures = [executor.submit(process_file, file_path, file_index) for file_index, file_path in enumerate(files, start=1)]
+        for future in futures:
+            result = future.result()
+            if result:
+                all_msd_data.extend(result)
+
+    # Save the aggregated MSD results
+    save_msd_results(all_msd_data, 'aggregated')
+
+    # After processing all files, plot the aggregated MSD
+    plot_aggregated_msd(all_msd_data)
+
+# Paths to the files
+files = [f'/rds/general/user/lm921/home/MSD/10000_125/replicate_{i}.txt' for i in range(1, 11)]
+
+# Calculate MSD for each start time in each replicate and plot
+process_files_parallel(files)
