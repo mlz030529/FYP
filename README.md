@@ -1,1 +1,1 @@
-This repositories stores part of the scripts that I generate for my final year research project in chromosome dynamics modelling, which based on coarse-grained biophysical modelling package(develop by francis cirsk institue) and mianly aim for physical measurements calculations . 
+This repository stores part of the scripts I generated for my final year research project in chromosome dynamics modeling, which is based on a coarse-grained biophysical modeling package(developed by Francis Cirsk Institute) and mainly aims for physical measurement calculations. 
